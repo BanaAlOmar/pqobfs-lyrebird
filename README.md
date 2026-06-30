@@ -1,3 +1,27 @@
+# pq-obfs: Post-Quantum obfs4 (ML-KEM-768 + Kemeleon)
+
+This fork extends Tor's lyrebird/obfs4proxy with a post-quantum handshake using
+ML-KEM-768 and the Kemeleon encoding, plus handshake padding normalization.
+It accompanies the paper *"Cryptographic Fingerprints in Tor Pluggable
+Transports: A Vulnerability Analysis and Post-Quantum Defense Framework"*
+(AlOmar & Trabelsi).
+
+## What this fork adds
+- `internal/mlkem_kemeleon/` — Kemeleon encode/decode, padding normalization (L_cover = 4096 B), Cloudflare CIRCL v1.5.0
+- `transports/obfs4/handshake_ntor_pq.go` — full pq-obfs handshake under `//go:build pqobfs` (classical path unmodified)
+
+## Reproducing the paper's results
+Built and tested with Go 1.25.
+
+    go test -tags pqobfs ./...
+
+Expected: 7/7 unit tests and 4/4 integration tests pass, including the
+1188-byte client and 2308-byte server pre-pad assertions and the
+(1460, 1460, 1192) TCP segment profile.
+
+---
+
+
 ## lyrebird - The obfourscator
 
 ### What?
