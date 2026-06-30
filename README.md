@@ -11,7 +11,8 @@ Transports: A Vulnerability Analysis and Post-Quantum Defense Framework"*
 - `transports/obfs4/handshake_ntor_pq.go` — full pq-obfs handshake under `//go:build pqobfs` (classical path unmodified)
 
 ## Reproducing the paper's results
-Built and tested with Go 1.25.
+Built with Go 1.22+ (see go.mod). The held-out detection experiment generates
+1,000 ML-KEM-768 keys with Go 1.25 crypto/mlkem.
 
     go test -tags pqobfs ./...
 
