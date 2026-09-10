@@ -128,6 +128,17 @@ func encodeEK(fipsEK []byte) ([]byte, bool) {
 		return nil, false
 	}
 
+	// IntegerRandomizeUnused (draft-irtf-cfrg-kemeleon): the bits under the
+	// mask are never used by an accepted accumulator, so fill them with fresh
+	// random bits. Without this step every representative would carry six
+	// fixed-zero bits at a known offset, an on-wire fingerprint with a 1/64
+	// false-positive rate. The decoder masks these bits off again.
+	var rb [1]byte
+	if _, err := io.ReadFull(rand.Reader, rb[:]); err != nil {
+		return nil, false
+	}
+	rLE[ThatLen-1] |= rb[0] & MSBByteMask
+
 	copy(out[ThatLen:], rho)
 	return out, true
 }
@@ -140,11 +151,13 @@ func decodeEK(encoded []byte) ([]byte, bool) {
 	rLE := encoded[:ThatLen] // little-endian accumulator
 	rho := encoded[ThatLen:] // 32 bytes
 
-	// big.Int wants big-endian; reverse rLE.
+	// big.Int wants big-endian; reverse rLE, clearing the randomized unused
+	// bits of the high-order byte (see encodeEK).
 	beBuf := make([]byte, ThatLen)
 	for i := 0; i < ThatLen; i++ {
 		beBuf[ThatLen-1-i] = rLE[i]
 	}
+	beBuf[0] &^= MSBByteMask
 	r := new(big.Int).SetBytes(beBuf)
 
 	qBig := big.NewInt(Q)
