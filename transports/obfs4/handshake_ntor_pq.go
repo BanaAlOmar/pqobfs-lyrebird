@@ -2,8 +2,33 @@
 
 /*
  * pq-obfs handshake: ML-KEM-768 + Kemeleon encoding replacement for the
- * classical Elligator 2 / X25519 ntor handshake. Gated behind the `pqobfs`
- * build tag so the default build is unaffected.
+ * classical Elligator 2 / X25519 ntor handshake, following the pq-obfs
+ * construction of Günther, Stebila and Veitch (CCS 2024). Gated behind the
+ * `pqobfs` build tag so the default build is unaffected.
+ *
+ * Message layout (all lengths in bytes; both messages are normalized to
+ * LCOVER = 4096 bytes and followed by a 16-byte MAC):
+ *
+ *   ClientHello:  c_S' (1252) | ek' (1156) | M_C (16) | pad -> 4096 | MAC_C (16)
+ *   ServerHello:  c_e' (1252) | AUTH (32) | M_S (16)  | pad -> 4096 | MAC_S (16)
+ *
+ * where
+ *   c_S' = Kemeleon(ML-KEM.Encaps(pk_S)), the static encapsulation to the
+ *          bridge's long-term ML-KEM-768 key, yielding K_S (known only to a
+ *          holder of sk_S and to the client);
+ *   ek'  = Kemeleon(ek_e), the client's ephemeral encapsulation key;
+ *   c_e' = Kemeleon(ML-KEM.Encaps(ek_e)), yielding K_e (forward secrecy).
+ *
+ * Every transmitted field is a Kemeleon representative, so the whole
+ * obfuscated KEM of [GSV24] is instantiated: each is computationally
+ * indistinguishable from uniform bytes under module-LWE, and the marks and
+ * MACs are pseudorandom under HMAC.
+ *
+ * Marks and MACs are keyed from K_S (strong obfuscation in the sense of
+ * sObfKE: an observer who merely holds the bridge line cannot verify or
+ * forge them). KEY_SEED and AUTH are derived from K_S || K_e and the full
+ * transcript (c_S || ek' || c_e) under the protocol identifier, mirroring the
+ * ntor key schedule with the two KEM secrets in place of xY and xB.
  *
  * This file lives in package obfs4 and reuses helpers from handshake_ntor.go
  * (markLength, macLength, getEpochHour, the Err* sentinels and InvalidMacError).
@@ -27,14 +52,16 @@ import (
 
 const (
 	// pqClientMinHandshakeLength is the smallest meaningful client hello: the
-	// Kemeleon-encoded ephemeral EK plus mark plus MAC.
-	pqClientMinHandshakeLength = mlkem_kemeleon.EncodedLen + markLength + macLength // 1156+16+16 = 1188
+	// encoded static-encapsulation ciphertext, the Kemeleon-encoded ephemeral
+	// EK, the mark and the MAC.
+	pqClientMinHandshakeLength = mlkem_kemeleon.EncodedCtLen + mlkem_kemeleon.EncodedLen +
+		markLength + macLength // 1252+1156+16+16 = 2440
 
 	// pqServerMinHandshakeLength is the smallest meaningful server hello: the
-	// Kemeleon-encoded ephemeral EK, the ML-KEM ciphertext encapsulated to the
-	// client, the AUTH tag, mark and MAC.
-	pqServerMinHandshakeLength = mlkem_kemeleon.EncodedLen + mlkem_kemeleon.CiphertextLen +
-		pqAuthLength + markLength + macLength // 1156+1088+32+16+16 = 2308
+	// encoded ML-KEM ciphertext encapsulated to the client's ephemeral EK, the
+	// AUTH tag, the mark and the MAC.
+	pqServerMinHandshakeLength = mlkem_kemeleon.EncodedCtLen + pqAuthLength +
+		markLength + macLength // 1252+32+16+16 = 1316
 
 	// pqCoverLength is the fixed size every handshake message is normalized to
 	// (before the trailing MAC).
@@ -46,6 +73,23 @@ const (
 
 	// pqAuthLength is the byte length of the ntor-style AUTH tag.
 	pqAuthLength = sha256.Size // 32
+
+	// pqMacKeyLength is the length of the HMAC key derived from K_S.
+	pqMacKeyLength = sha256.Size // 32
+)
+
+// Field offsets inside the client hello cover region.
+const (
+	pqCliCtOff   = 0
+	pqCliEKOff   = pqCliCtOff + mlkem_kemeleon.EncodedCtLen
+	pqCliMarkOff = pqCliEKOff + mlkem_kemeleon.EncodedLen
+)
+
+// Field offsets inside the server hello cover region.
+const (
+	pqSrvCtOff   = 0
+	pqSrvAuthOff = pqSrvCtOff + mlkem_kemeleon.EncodedCtLen
+	pqSrvMarkOff = pqSrvAuthOff + pqAuthLength
 )
 
 // pq-obfs KDF protocol identifiers. These differ from the classical ntor
@@ -55,29 +99,52 @@ var (
 	pqTKey    = append(append([]byte{}, pqProtoID...), []byte(":key_extract")...)
 	pqTVerify = append(append([]byte{}, pqProtoID...), []byte(":key_verify")...)
 	pqTMac    = append(append([]byte{}, pqProtoID...), []byte(":mac")...)
+	pqTMacKey = append(append([]byte{}, pqProtoID...), []byte(":mac_key")...)
 )
 
-// pqMacKey builds the HMAC key for handshake marks/MACs: the first 32 bytes of
-// the server's advertised static EK concatenated with the node ID. This mirrors
-// the classical handshake's (serverIdentity || nodeID) keying.
-func pqMacKey(serverRawEK []byte, nodeID *ntor.NodeID) []byte {
-	key := make([]byte, 0, 32+ntor.NodeIDLength)
-	key = append(key, serverRawEK[:32]...)
-	key = append(key, nodeID.Bytes()[:]...)
-	return key
+// pqMacKey derives the HMAC key for handshake marks and MACs from the static
+// shared secret K_S and the node ID:
+//
+//	macKey = HMAC-SHA256(t_mac_key, K_S || NodeID)
+//
+// Because K_S is only obtainable by decapsulating c_S with sk_S, an observer
+// who holds the bridge line (pk_S, NodeID) but not sk_S can neither verify nor
+// forge the marks, which is what distinguishes the pq-obfs/st-obfs keying from
+// the classical (B || NodeID) keying of obfs4.
+func pqMacKey(staticSS []byte, nodeID *ntor.NodeID) []byte {
+	h := hmac.New(sha256.New, pqTMacKey)
+	h.Write(staticSS)
+	h.Write(nodeID.Bytes()[:])
+	return h.Sum(nil)[:pqMacKeyLength]
 }
 
-// pqNtorCommon derives KEY_SEED and AUTH from the KEM shared secret, preserving
-// the ntor KDF structure with KEM in place of Diffie-Hellman.
-func pqNtorCommon(ss []byte, id *ntor.NodeID) (keySeed, auth []byte) {
+// pqNtorCommon derives KEY_SEED and AUTH from the two KEM shared secrets and
+// the handshake transcript, preserving the ntor KDF structure:
+//
+//	secret_input = K_S || K_e || NodeID || c_S || ek' || c_e || ProtoID
+//	KEY_SEED     = HMAC(t_key,    secret_input)
+//	verify       = HMAC(t_verify, secret_input)
+//	AUTH         = HMAC(t_mac,    verify || NodeID || ProtoID || "Server")
+//
+// K_S plays the role of xB (static authentication of the bridge), K_e the role
+// of xY (forward secrecy); the transcript binding replaces X || Y || B.
+// The transcript fields are the encoded forms as transmitted.
+func pqNtorCommon(staticSS, ephSS []byte, id *ntor.NodeID, cS, encEK, cE []byte) (keySeed, auth []byte) {
+	var secretInput bytes.Buffer
+	secretInput.Write(staticSS)
+	secretInput.Write(ephSS)
+	secretInput.Write(id.Bytes()[:])
+	secretInput.Write(cS)
+	secretInput.Write(encEK)
+	secretInput.Write(cE)
+	secretInput.Write(pqProtoID)
+
 	h := hmac.New(sha256.New, pqTKey)
-	h.Write(ss)
-	h.Write(id.Bytes()[:])
+	h.Write(secretInput.Bytes())
 	keySeed = h.Sum(nil)
 
 	h = hmac.New(sha256.New, pqTVerify)
-	h.Write(ss)
-	h.Write(id.Bytes()[:])
+	h.Write(secretInput.Bytes())
 	verify := h.Sum(nil)
 
 	h = hmac.New(sha256.New, pqTMac)
@@ -91,11 +158,14 @@ func pqNtorCommon(ss []byte, id *ntor.NodeID) (keySeed, auth []byte) {
 
 // pqClientHandshake holds the state for the pq-obfs client handshake.
 type pqClientHandshake struct {
-	ephKP       *mlkem_kemeleon.KeyPair // client ephemeral keypair
 	nodeID      *ntor.NodeID
-	serverRawEK []byte // server's advertised static raw ML-KEM EK (1184 bytes)
-	epochHour   []byte
-	mac         hash.Hash
+	serverRawEK []byte // bridge's advertised static raw ML-KEM EK (1184 bytes), from the bridge line
+
+	ephKP     *mlkem_kemeleon.KeyPair           // ephemeral keypair (dk retained for decapsulation)
+	staticCt  *mlkem_kemeleon.EncodedCiphertext // c_S' and K_S
+	encEK     []byte                            // Kemeleon-encoded ephemeral EK as sent
+	epochHour []byte
+	mac       hash.Hash
 
 	serverMark []byte
 }
@@ -104,31 +174,38 @@ func newPQClientHandshake(nodeID *ntor.NodeID, serverRawEK []byte) (*pqClientHan
 	if len(serverRawEK) != mlkem_kemeleon.RawEKLen {
 		return nil, fmt.Errorf("pq handshake: server EK must be %d bytes, got %d", mlkem_kemeleon.RawEKLen, len(serverRawEK))
 	}
-	hs := &pqClientHandshake{
+	return &pqClientHandshake{
 		nodeID:      nodeID,
 		serverRawEK: serverRawEK,
-	}
-	hs.mac = hmac.New(sha256.New, pqMacKey(serverRawEK, nodeID))
-	return hs, nil
+	}, nil
 }
 
 // generateHandshake produces the client hello:
 //
-//	[ enc_eph_pk (1156) | M_C (16) | random pad ] -> normalized to 4096 | MAC_C (16)
+//	[ c_S' (1252) | ek' (1156) | M_C (16) | random pad ] -> normalized to 4096 | MAC_C (16)
 func (hs *pqClientHandshake) generateHandshake() ([]byte, error) {
 	kp, err := mlkem_kemeleon.GenerateKeyPair(nil)
 	if err != nil {
 		return nil, err
 	}
+	// Encapsulate to the bridge's static key, retrying until the ciphertext
+	// encodes under Kemeleon (acceptance ~0.77).
+	sct, err := mlkem_kemeleon.EncapsulateEncoded(hs.serverRawEK)
+	if err != nil {
+		return nil, err
+	}
 	hs.ephKP = kp
-	encEphPK := kp.Representative() // 1156 bytes
-
-	hs.mac.Reset()
-	hs.mac.Write(encEphPK)
-	mark := hs.mac.Sum(nil)[:markLength]
+	hs.staticCt = sct
+	hs.encEK = kp.Representative() // 1156 bytes
+	hs.mac = hmac.New(sha256.New, pqMacKey(sct.SharedSecret, hs.nodeID))
 
 	var base bytes.Buffer
-	base.Write(encEphPK)
+	base.Write(sct.Encoded) // c_S'
+	base.Write(hs.encEK)    // ek'
+
+	hs.mac.Reset()
+	hs.mac.Write(base.Bytes())
+	mark := hs.mac.Sum(nil)[:markLength]
 	base.Write(mark)
 
 	padded, err := mlkem_kemeleon.NormalizePadding(base.Bytes())
@@ -146,9 +223,12 @@ func (hs *pqClientHandshake) generateHandshake() ([]byte, error) {
 }
 
 // parseServerHandshake validates the server hello, decapsulates the ML-KEM
-// ciphertext to recover the shared secret, verifies AUTH, and returns the
-// derived KEY_SEED.
+// ciphertext to recover K_e, derives KEY_SEED/AUTH from both shared secrets
+// and the transcript, verifies AUTH, and returns the derived KEY_SEED.
 func (hs *pqClientHandshake) parseServerHandshake(resp []byte) (int, []byte, error) {
+	if hs.ephKP == nil || hs.staticCt == nil {
+		return 0, nil, ErrInvalidHandshake
+	}
 	if len(resp) < pqHandshakeLength {
 		return 0, nil, ErrMarkNotFoundYet
 	}
@@ -156,27 +236,20 @@ func (hs *pqClientHandshake) parseServerHandshake(resp []byte) (int, []byte, err
 		return 0, nil, ErrInvalidHandshake
 	}
 
-	// Fixed layout within the cover region:
-	//   enc_resp_pk | ct_to_client | AUTH | mark | pad...
-	off := 0
-	serverEncEK := resp[off : off+mlkem_kemeleon.EncodedLen]
-	off += mlkem_kemeleon.EncodedLen
-	ct := resp[off : off+mlkem_kemeleon.CiphertextLen]
-	off += mlkem_kemeleon.CiphertextLen
-	serverAuth := resp[off : off+pqAuthLength]
-	off += pqAuthLength
-	markRx := resp[off : off+markLength]
+	// Fixed layout within the cover region: c_e' | AUTH | mark | pad...
+	encCt := resp[pqSrvCtOff : pqSrvCtOff+mlkem_kemeleon.EncodedCtLen]
+	serverAuth := resp[pqSrvAuthOff : pqSrvAuthOff+pqAuthLength]
+	markRx := resp[pqSrvMarkOff : pqSrvMarkOff+markLength]
 
-	// Derive and check the mark over (enc_resp_pk | ct | AUTH).
+	// Mark over (c_e' | AUTH), keyed from K_S.
 	hs.mac.Reset()
-	hs.mac.Write(resp[:mlkem_kemeleon.EncodedLen+mlkem_kemeleon.CiphertextLen+pqAuthLength])
+	hs.mac.Write(resp[:pqSrvMarkOff])
 	hs.serverMark = hs.mac.Sum(nil)[:markLength]
 	if !hmac.Equal(markRx, hs.serverMark) {
 		return 0, nil, ErrInvalidHandshake
 	}
 
-	// MAC_C/MAC_S is the trailing macLength bytes; it covers the cover region
-	// (everything but the trailing MAC) plus the epoch hour.
+	// MAC_S covers the cover region plus the epoch hour.
 	hs.mac.Reset()
 	hs.mac.Write(resp[:pqCoverLength])
 	hs.mac.Write(hs.epochHour)
@@ -186,18 +259,17 @@ func (hs *pqClientHandshake) parseServerHandshake(resp []byte) (int, []byte, err
 		return 0, nil, &InvalidMacError{macCmp, macRx}
 	}
 
-	// The server ephemeral EK is decoded only to keep the wire format honest;
-	// the shared secret comes from decapsulating the ciphertext the server
-	// encapsulated to our ephemeral key.
-	if _, err := mlkem_kemeleon.DecodeEK(serverEncEK); err != nil {
-		return 0, nil, fmt.Errorf("pq handshake: decode server EK: %w", err)
+	ct, err := mlkem_kemeleon.DecodeCiphertext(encCt)
+	if err != nil {
+		return 0, nil, fmt.Errorf("pq handshake: decode ciphertext: %w", err)
 	}
-	ss, err := hs.ephKP.Decapsulate(ct)
+	ephSS, err := hs.ephKP.Decapsulate(ct)
 	if err != nil {
 		return 0, nil, fmt.Errorf("pq handshake: decapsulate: %w", err)
 	}
 
-	keySeed, auth := pqNtorCommon(ss, hs.nodeID)
+	keySeed, auth := pqNtorCommon(hs.staticCt.SharedSecret, ephSS, hs.nodeID,
+		hs.staticCt.Encoded, hs.encEK, encCt)
 	if !hmac.Equal(auth, serverAuth) {
 		return 0, nil, ErrNtorFailed
 	}
@@ -206,27 +278,29 @@ func (hs *pqClientHandshake) parseServerHandshake(resp []byte) (int, []byte, err
 
 // pqServerHandshake holds the state for the pq-obfs server handshake.
 type pqServerHandshake struct {
-	nodeID      *ntor.NodeID
-	serverRawEK []byte
-	mac         hash.Hash
-	epochHour   []byte
-	serverAuth  []byte
+	nodeID   *ntor.NodeID
+	staticKP *mlkem_kemeleon.KeyPair // bridge's long-term ML-KEM-768 keypair (sk_S, pk_S)
 
-	ctToClient []byte // ML-KEM ciphertext encapsulated to the client's ephemeral EK
+	epochHour  []byte
+	mac        hash.Hash
+	serverAuth []byte
+	ctToClient []byte // c_e', the encoded encapsulation to the client's ephemeral EK
 }
 
-func newPQServerHandshake(nodeID *ntor.NodeID, serverRawEK []byte) *pqServerHandshake {
-	hs := &pqServerHandshake{
-		nodeID:      nodeID,
-		serverRawEK: serverRawEK,
+func newPQServerHandshake(nodeID *ntor.NodeID, staticKP *mlkem_kemeleon.KeyPair) *pqServerHandshake {
+	return &pqServerHandshake{
+		nodeID:   nodeID,
+		staticKP: staticKP,
 	}
-	hs.mac = hmac.New(sha256.New, pqMacKey(serverRawEK, nodeID))
-	return hs
 }
 
-// parseClientHandshake validates the client hello, encapsulates to the client's
-// ephemeral EK (producing both the ciphertext to return and the shared secret),
-// derives KEY_SEED/AUTH, and returns KEY_SEED.
+// parseClientHandshake decapsulates c_S with sk_S to obtain K_S, derives the
+// mark/MAC key from it, validates the hello (mark, MAC with epoch tolerance,
+// replay filter), decodes the client's ephemeral EK, encapsulates to it, and
+// derives KEY_SEED/AUTH. It returns KEY_SEED.
+//
+// Every failure path returns before any response is generated, so a probe
+// that does not carry a valid c_S/mark/MAC is met with silence, as in obfs4.
 func (hs *pqServerHandshake) parseClientHandshake(filter *replayfilter.ReplayFilter, resp []byte) ([]byte, error) {
 	if len(resp) < pqHandshakeLength {
 		return nil, ErrMarkNotFoundYet
@@ -235,11 +309,26 @@ func (hs *pqServerHandshake) parseClientHandshake(filter *replayfilter.ReplayFil
 		return nil, ErrInvalidHandshake
 	}
 
-	clientEncEK := resp[:mlkem_kemeleon.EncodedLen]
-	markRx := resp[mlkem_kemeleon.EncodedLen : mlkem_kemeleon.EncodedLen+markLength]
+	encCS := resp[pqCliCtOff : pqCliCtOff+mlkem_kemeleon.EncodedCtLen]
+	clientEncEK := resp[pqCliEKOff : pqCliEKOff+mlkem_kemeleon.EncodedLen]
+	markRx := resp[pqCliMarkOff : pqCliMarkOff+markLength]
+
+	// K_S <- Decaps(sk_S, Kemeleon^-1(c_S')). Every 1252-byte string decodes,
+	// and ML-KEM decapsulation is implicit-rejection, so a garbage c_S' yields
+	// a pseudorandom K_S and the mark check below fails without revealing
+	// which step went wrong.
+	cS, err := mlkem_kemeleon.DecodeCiphertext(encCS)
+	if err != nil {
+		return nil, ErrInvalidHandshake
+	}
+	staticSS, err := hs.staticKP.Decapsulate(cS)
+	if err != nil {
+		return nil, ErrInvalidHandshake
+	}
+	hs.mac = hmac.New(sha256.New, pqMacKey(staticSS, hs.nodeID))
 
 	hs.mac.Reset()
-	hs.mac.Write(clientEncEK)
+	hs.mac.Write(resp[:pqCliMarkOff]) // c_S' | ek'
 	clientMark := hs.mac.Sum(nil)[:markLength]
 	if !hmac.Equal(markRx, clientMark) {
 		return nil, ErrInvalidHandshake
@@ -270,34 +359,30 @@ func (hs *pqServerHandshake) parseClientHandshake(filter *replayfilter.ReplayFil
 	if err != nil {
 		return nil, fmt.Errorf("pq handshake: decode client EK: %w", err)
 	}
-	ct, ss, err := mlkem_kemeleon.Encapsulate(clientRawEK)
+	ect, err := mlkem_kemeleon.EncapsulateEncoded(clientRawEK)
 	if err != nil {
 		return nil, fmt.Errorf("pq handshake: encapsulate to client EK: %w", err)
 	}
-	hs.ctToClient = ct
+	hs.ctToClient = ect.Encoded
 
-	keySeed, auth := pqNtorCommon(ss, hs.nodeID)
+	keySeed, auth := pqNtorCommon(staticSS, ect.SharedSecret, hs.nodeID,
+		encCS, clientEncEK, ect.Encoded)
 	hs.serverAuth = auth
 	return keySeed, nil
 }
 
 // generateHandshake produces the server hello:
 //
-//	[ enc_resp_pk (1156) | ct_to_client (1088) | AUTH (32) | M_S (16) | pad ] -> 4096 | MAC_S (16)
+//	[ c_e' (1252) | AUTH (32) | M_S (16) | pad ] -> 4096 | MAC_S (16)
 //
-// parseClientHandshake MUST have run first (it sets ctToClient, serverAuth and epochHour).
+// parseClientHandshake MUST have run first (it sets ctToClient, serverAuth,
+// epochHour and the K_S-keyed MAC).
 func (hs *pqServerHandshake) generateHandshake() ([]byte, error) {
-	if hs.ctToClient == nil || hs.serverAuth == nil {
+	if hs.ctToClient == nil || hs.serverAuth == nil || hs.mac == nil {
 		return nil, ErrInvalidHandshake
 	}
-	kp, err := mlkem_kemeleon.GenerateKeyPair(nil)
-	if err != nil {
-		return nil, err
-	}
-	encEphPK := kp.Representative()
 
 	var base bytes.Buffer
-	base.Write(encEphPK)
 	base.Write(hs.ctToClient)
 	base.Write(hs.serverAuth)
 

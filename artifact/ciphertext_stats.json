@@ -1,0 +1,13 @@
+{
+  "encoded_detected": 2,
+  "encoded_mean": -6.3529279562634136,
+  "encoded_sd": 3.591240248425514,
+  "n": 1000,
+  "null_mean": -6.207475900431795,
+  "null_sd": 3.4928615539585715,
+  "raw_detected": 688,
+  "raw_mean": 6.519981739736441,
+  "raw_sd": 3.673608814566584,
+  "raw_sigma_separation": 3.643848301328692,
+  "threshold_alpha_0.001": 4.58546630130019
+}

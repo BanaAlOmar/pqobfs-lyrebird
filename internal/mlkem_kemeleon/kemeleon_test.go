@@ -120,3 +120,28 @@ func TestDecodeEKGarbage(t *testing.T) {
 	}
 	_, _ = mk.DecodeEK(garbage) // result ignored; only the no-panic property matters
 }
+
+// TestUnusedBitsRandomized checks that the six unused high-order bits of the
+// accumulator are not constant across representatives (IntegerRandomizeUnused),
+// and that decoding still recovers the raw key.
+func TestUnusedBitsRandomized(t *testing.T) {
+	seen := map[byte]bool{}
+	for i := 0; i < 200; i++ {
+		kp, err := mk.GenerateKeyPair(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rep := kp.Representative()
+		seen[rep[mk.ThatLen-1]&mk.MSBByteMask] = true
+		raw, err := mk.DecodeEK(rep)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal(raw, kp.RawEncapsulationKey()) {
+			t.Fatal("round trip mismatch with randomized unused bits")
+		}
+	}
+	if len(seen) < 8 {
+		t.Fatalf("unused top bits look constant: only %d distinct patterns in 200 keys", len(seen))
+	}
+}
