@@ -1,0 +1,107 @@
+diff --git a/lib/chutney/tor/builder.py b/lib/chutney/tor/builder.py
+index 0f13459..0d0005b 100644
+--- a/lib/chutney/tor/builder.py
++++ b/lib/chutney/tor/builder.py
+@@ -624,6 +624,14 @@ class TorNodeBuilder(NodeBuilder):
+                     obfs4proxy_exe=str(self._node._config.pt_executable),
+                     pt_state_path=pt_state_path,
+                 )
++            case "pqobfs":
++                pt_state_path = Path(self._node.dir, "pt_state")
++                return _get_obfs4_extra_args(
++                    launcher=self._launcher,
++                    obfs4proxy_exe=str(self._node._config.pt_executable),
++                    pt_state_path=pt_state_path,
++                    transport="pqobfs",
++                )
+             case unhandled:
+                 raise chutney.errors.ChutneyError(
+                     "Unhandled pt_transport: " + unhandled
+@@ -633,9 +641,7 @@ class TorNodeBuilder(NodeBuilder):
+ def _get_obfs4_extra_args_if_present(
+     *,
+     bridge_path: Path,
+-    _pattern: re.Pattern[str] = re.compile(
+-        r"Bridge obfs4 <IP ADDRESS>:<PORT> <FINGERPRINT> (cert.*)\n"
+-    ),
++    transport: str = "obfs4",
+ ) -> Optional[str]:
+     """Returns the extra key-val args from the given `bridge_path`, if it exists and can be parsed.
+ 
+@@ -646,7 +652,11 @@ def _get_obfs4_extra_args_if_present(
+     try:
+         with open(bridge_path, "r") as f:
+             for line in f:
+-                if m := _pattern.match(line):
++                first = "cert" if transport == "obfs4" else "pq-id"
++                pattern = re.compile(
++                    rf"Bridge {transport} <IP ADDRESS>:<PORT> <FINGERPRINT> ({first}.*)\n"
++                )
++                if m := pattern.match(line):
+                     return m.group(1)
+     except FileNotFoundError:
+         # File doesn't exist
+@@ -657,17 +667,23 @@ def _get_obfs4_extra_args_if_present(
+ 
+ 
+ def _get_obfs4_extra_args(
+-    *, launcher: chutney.launcher.Launcher, obfs4proxy_exe: str, pt_state_path: Path
++    *,
++    launcher: chutney.launcher.Launcher,
++    obfs4proxy_exe: str,
++    pt_state_path: Path,
++    transport: str = "obfs4",
+ ) -> str:
+     """Returns the extra key-val args needed to use an obfs4proxy pt bridge,
+     with state at `pt_state_path`.
+ 
+     If the data isn't already present, runs obfs4proxy to generate it.
+     """
+-    bridge_path = pt_state_path.joinpath("obfs4_bridgeline.txt")
++    bridge_path = pt_state_path.joinpath(f"{transport}_bridgeline.txt")
+ 
+     if (
+-        extra_args := _get_obfs4_extra_args_if_present(bridge_path=bridge_path)
++        extra_args := _get_obfs4_extra_args_if_present(
++            bridge_path=bridge_path, transport=transport
++        )
+     ) is not None:
+         return extra_args
+ 
+@@ -684,10 +700,10 @@ def _get_obfs4_extra_args(
+             # and should succeed since we're using 0 (any available port).
+             # It actually will still generate the state files if it's a port that can't
+             # be bound, but it'll exit with an error.
+-            TOR_PT_SERVER_BINDADDR="obfs4-127.0.0.1:0",
++            TOR_PT_SERVER_BINDADDR=f"{transport}-127.0.0.1:0",
+             TOR_PT_MANAGED_TRANSPORT_VER="1",
+             TOR_PT_STATE_LOCATION=str(pt_state_path.resolve()),
+-            TOR_PT_SERVER_TRANSPORTS="obfs4",
++            TOR_PT_SERVER_TRANSPORTS=transport,
+         ),
+         known_bin=None,
+         text=True,
+@@ -707,7 +723,9 @@ def _get_obfs4_extra_args(
+                 f"obfs4proxy exited unexpectedly with returncode={completed.returncode}"
+             )
+         if (
+-            extra_args := _get_obfs4_extra_args_if_present(bridge_path=bridge_path)
++            extra_args := _get_obfs4_extra_args_if_present(
++                bridge_path=bridge_path, transport=transport
++            )
+         ) is not None:
+             # Done. Terminate and wait for process to exit.
+             completed = p.shutdown()
+diff --git a/lib/chutney/tor/torrc.py b/lib/chutney/tor/torrc.py
+index 3140bb0..fb378b6 100644
+--- a/lib/chutney/tor/torrc.py
++++ b/lib/chutney/tor/torrc.py
+@@ -415,7 +415,7 @@ def format(n: TorNet.Node, tor_version: str) -> str:
+         res += textwrap.dedent(f"""
+             ServerTransportPlugin {n._config.pt_transport} exec {pt_executable}
+             ExtOrPort {n.extorport}
+-            ServerTransportListenAddr obfs4 {addr_and_port_str(ip, n.ptport)}
++            ServerTransportListenAddr {n._config.pt_transport} {addr_and_port_str(ip, n.ptport)}
+             """)
+     if n._config.bridgeclient:
+         res += "UseBridges 1\n"

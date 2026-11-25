@@ -1,24 +1,38 @@
-# pq-obfs: Post-Quantum obfs4 (ML-KEM-768 + Kemeleon)
+# pq-obfs: Post-Quantum obfs4 (ML-KEM-768 + Kemeleon) for lyrebird
 
-This fork extends Tor's lyrebird/obfs4proxy with a post-quantum handshake using
-ML-KEM-768 and the Kemeleon encoding, plus handshake padding normalization.
-It accompanies the paper *"Cryptographic Fingerprints in Tor Pluggable
-Transports: A Vulnerability Analysis and Post-Quantum Defense Framework"*
-(AlOmar & Trabelsi).
+This fork adds a post-quantum transport, `pqobfs`, to Tor's lyrebird. It
+implements the pq-obfs handshake (Günther, Stebila and Veitch, CCS 2024) with
+Kemeleon encoding of every ML-KEM object on the wire, inside lyrebird's normal
+connection path. It accompanies the paper *"Migrating a Deployed
+Censorship-Circumvention Transport to Post-Quantum Key Exchange: Wire-Image
+Leakage, Defenses, and Conformance Testing in Tor's obfs4"* (AlOmar &
+Trabelsi, under submission).
+
+Everything is behind the `pqobfs` build tag; the default build is unchanged.
 
 ## What this fork adds
-- `internal/mlkem_kemeleon/` — Kemeleon encode/decode, padding normalization (L_cover = 4096 B), Cloudflare CIRCL v1.5.0
-- `transports/obfs4/handshake_ntor_pq.go` — full pq-obfs handshake under `//go:build pqobfs` (classical path unmodified)
 
-## Reproducing the paper's results
-Built with Go 1.22+ (see go.mod). The held-out detection experiment generates
-1,000 ML-KEM-768 keys with Go 1.25 crypto/mlkem.
+| Path | Contents |
+|---|---|
+| `internal/mlkem_kemeleon/` | Kemeleon rejection-sampling encode/decode of ML-KEM-768 keys and ciphertexts (CIRCL v1.5.0); fixed-width mixed-radix codec (`radix.go`); `VZEROUPPER` shim for CIRCL's AVX2 assembly (`vzu_amd64.s`); seeded static key pairs |
+| `transports/obfs4/handshake_ntor_pq.go` | pq-obfs messages, key schedule, cover policies (`fixed`, `uniform`, `uniform-hide`) |
+| `transports/obfs4/pqobfs.go` | the `pqobfs` transport: bridge state and bridge line (`pq-cert`, `iat-mode`, `pq-cover`), client key-material precomputation, connection handshake; reuses obfs4's data channel |
+| `transports/register_pqobfs.go` | registers `pqobfs` when built with the tag |
+| `artifact/` | measurement scripts and the Rust interop harness; see `artifact/README.md` |
 
-    go test -tags pqobfs ./...
+## Build and test
 
-Expected: 7/7 unit tests and 4/4 integration tests pass, including the
-1188-byte client and 2308-byte server pre-pad assertions and the
-(1460, 1460, 1192) TCP segment profile.
+    go test ./...                       # default build, unchanged
+    go test -tags pqobfs ./...          # encoder, handshake and end-to-end transport tests
+    go build -tags pqobfs ./cmd/lyrebird
+
+Bridge line example (server writes `pqobfs_state.json` in its state directory):
+
+    Bridge pqobfs 192.0.2.1:443 <FINGERPRINT> pq-cert=<base64 NodeID||pk_S> iat-mode=0 pq-cover=uniform
+
+## Reproducing the paper
+
+See `artifact/README.md`.
 
 ---
 

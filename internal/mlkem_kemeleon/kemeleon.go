@@ -17,16 +17,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 
 	mlkem768 "github.com/cloudflare/circl/kem/mlkem/mlkem768"
 )
 
 const (
-	K        = 3    // module rank for ML-KEM-768
-	N        = 256  // polynomial degree
-	Q        = 3329 // modulus
-	RhoLen   = 32   // public seed, appended at the end of the FIPS encoding
+	K        = 3     // module rank for ML-KEM-768
+	N        = 256   // polynomial degree
+	Q        = 3329  // modulus
+	RhoLen   = 32    // public seed, appended at the end of the FIPS encoding
 	CoeffLen = K * N // = 768 coefficients total
 
 	// FIPSCoeffBytes is the size of the 12-bit packed coefficient block in a
@@ -102,25 +101,11 @@ func encodeEK(fipsEK []byte) ([]byte, bool) {
 	rho := fipsEK[FIPSCoeffBytes : FIPSCoeffBytes+RhoLen]
 	coeffs := unpack12(fipsEK[:FIPSCoeffBytes]) // len == CoeffLen
 
-	r := new(big.Int)
-	qBig := big.NewInt(Q)
-	qPow := big.NewInt(1)
-	term := new(big.Int)
-	for i := 0; i < CoeffLen; i++ {
-		term.SetUint64(uint64(coeffs[i]))
-		term.Mul(term, qPow)
-		r.Add(r, term)
-		qPow.Mul(qPow, qBig)
-	}
-
-	// Serialize little-endian into exactly ThatLen bytes.
+	// Mixed-radix accumulate r = sum coeff[i] * q^i, little-endian, in
+	// ThatLen bytes (fixed-width limb arithmetic, see radix.go).
 	out := make([]byte, EncodedLen)
 	rLE := out[:ThatLen]
-	rBytes := r.Bytes() // big-endian
-	for i, bv := range rBytes {
-		// little-endian position of big-endian byte i
-		rLE[len(rBytes)-1-i] = bv
-	}
+	radixEncode(rLE, coeffs)
 
 	// Rejection: high-order byte (last little-endian byte) must have no bits set
 	// under the mask.
@@ -151,27 +136,13 @@ func decodeEK(encoded []byte) ([]byte, bool) {
 	rLE := encoded[:ThatLen] // little-endian accumulator
 	rho := encoded[ThatLen:] // 32 bytes
 
-	// big.Int wants big-endian; reverse rLE, clearing the randomized unused
-	// bits of the high-order byte (see encodeEK).
-	beBuf := make([]byte, ThatLen)
-	for i := 0; i < ThatLen; i++ {
-		beBuf[ThatLen-1-i] = rLE[i]
-	}
-	beBuf[0] &^= MSBByteMask
-	r := new(big.Int).SetBytes(beBuf)
-
-	qBig := big.NewInt(Q)
-	rem := new(big.Int)
+	// IntegerClearUnused: drop the randomized unused bits of the high-order
+	// byte (see encodeEK), then recover the digits.
+	acc := make([]byte, ThatLen)
+	copy(acc, rLE)
+	acc[ThatLen-1] &^= MSBByteMask
 	coeffs := make([]uint16, CoeffLen)
-	for i := 0; i < CoeffLen; i++ {
-		r.DivMod(r, qBig, rem)
-		c := rem.Uint64()
-		if c >= Q {
-			return nil, false
-		}
-		coeffs[i] = uint16(c)
-	}
-	if r.Sign() != 0 {
+	if !radixDecode(coeffs, acc) {
 		return nil, false
 	}
 
@@ -198,6 +169,7 @@ func GenerateKeyPair(rng io.Reader) (*KeyPair, error) {
 	}
 	for attempts := 0; attempts < 100; attempts++ {
 		pk, sk, err := mlkem768.GenerateKeyPair(rng)
+		afterAVX()
 		if err != nil {
 			return nil, fmt.Errorf("mlkem_kemeleon: keygen: %w", err)
 		}
@@ -214,10 +186,10 @@ func GenerateKeyPair(rng io.Reader) (*KeyPair, error) {
 }
 
 // Representative returns a fresh copy of the Kemeleon-encoded encapsulation key
-// (EncodedLen bytes). This replaces the 32-byte Elligator 2 representative on
+// (EncodedLen bytes, or DefaultEKLen for a default-encoded pair). This replaces the 32-byte Elligator 2 representative on
 // the wire.
 func (kp *KeyPair) Representative() []byte {
-	out := make([]byte, EncodedLen)
+	out := make([]byte, len(kp.representative))
 	copy(out, kp.representative)
 	return out
 }
@@ -237,6 +209,7 @@ func (kp *KeyPair) Decapsulate(ct []byte) ([]byte, error) {
 	}
 	ss := make([]byte, SharedSecretLen)
 	kp.dk.DecapsulateTo(ss, ct)
+	afterAVX()
 	return ss, nil
 }
 
@@ -247,7 +220,9 @@ func Encapsulate(rawEK []byte) ([]byte, []byte, error) {
 		return nil, nil, fmt.Errorf("mlkem_kemeleon: raw EK must be %d bytes, got %d", RawEKLen, len(rawEK))
 	}
 	ek := new(mlkem768.PublicKey)
-	if err := ek.Unpack(rawEK); err != nil {
+	err := ek.Unpack(rawEK)
+	afterAVX()
+	if err != nil {
 		return nil, nil, fmt.Errorf("mlkem_kemeleon: invalid EK: %w", err)
 	}
 	seed := make([]byte, mlkem768.EncapsulationSeedSize)
@@ -257,6 +232,7 @@ func Encapsulate(rawEK []byte) ([]byte, []byte, error) {
 	ct := make([]byte, CiphertextLen)
 	ss := make([]byte, SharedSecretLen)
 	ek.EncapsulateTo(ct, ss, seed)
+	afterAVX()
 	return ct, ss, nil
 }
 
@@ -281,4 +257,23 @@ func DecodeEK(encoded []byte) ([]byte, error) {
 		return nil, errors.New("mlkem_kemeleon: invalid Kemeleon encoding")
 	}
 	return rawEK, nil
+}
+
+// StaticSeedSize is the length of the seed from which a bridge's long-term
+// ML-KEM-768 keypair is derived (d || z of FIPS 203).
+const StaticSeedSize = mlkem768.KeySeedSize
+
+// KeyPairFromSeed deterministically derives a long-term ML-KEM-768 keypair,
+// for a bridge that persists its static key as a seed in its state file. The
+// static encapsulation key travels in the bridge line, not on the wire, so it
+// is not required to be Kemeleon-encodable and no representative is stored.
+func KeyPairFromSeed(seed []byte) (*KeyPair, error) {
+	if len(seed) != StaticSeedSize {
+		return nil, fmt.Errorf("mlkem_kemeleon: seed must be %d bytes, got %d", StaticSeedSize, len(seed))
+	}
+	pk, sk := mlkem768.NewKeyFromSeed(seed)
+	raw := make([]byte, mlkem768.PublicKeySize)
+	pk.Pack(raw)
+	afterAVX()
+	return &KeyPair{dk: sk, rawEK: raw}, nil
 }

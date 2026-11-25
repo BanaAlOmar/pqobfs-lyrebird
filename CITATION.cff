@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software or data, please cite it as below."
+title: "pq-obfs in lyrebird: code, data and analysis for \"Migrating a Deployed Censorship-Circumvention Transport to Post-Quantum Key Exchange\""
+version: 1.0.1
+doi: 10.5281/zenodo.24521450
+license: BSD-3-Clause
+repository-code: "https://github.com/BanaAlOmar/pqobfs-lyrebird"
+authors:
+  - family-names: AlOmar
+    given-names: Ban
+    affiliation: "Higher Colleges of Technology, United Arab Emirates"
+    email: balomar@hct.ac.ae
+  - family-names: Trabelsi
+    given-names: Zouheir
+    affiliation: "United Arab Emirates University, Al Ain, United Arab Emirates"
+keywords:
+  - Tor
+  - pluggable transports
+  - post-quantum migration
+  - ML-KEM
+  - censorship circumvention

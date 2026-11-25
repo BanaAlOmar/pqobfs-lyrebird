@@ -160,22 +160,9 @@ func encodeCt(ct []byte, rng io.Reader) ([]byte, bool, error) {
 	}
 
 	// VectorEncodeR: mixed-radix accumulate, reject on a set top bit.
-	r := new(big.Int)
-	qBig := big.NewInt(Q)
-	qPow := big.NewInt(1)
-	term := new(big.Int)
-	for i := 0; i < CoeffLen; i++ {
-		term.SetUint64(uint64(coeffs[i]))
-		term.Mul(term, qPow)
-		r.Add(r, term)
-		qPow.Mul(qPow, qBig)
-	}
 	out := make([]byte, EncodedCtLen)
 	rLE := out[:ThatLen]
-	rBytes := r.Bytes() // big-endian
-	for i, bv := range rBytes {
-		rLE[len(rBytes)-1-i] = bv
-	}
+	radixEncode(rLE, coeffs)
 	if rLE[ThatLen-1]&MSBByteMask != 0 {
 		return nil, false, nil
 	}
@@ -218,26 +205,16 @@ func decodeCt(ec []byte) ([]byte, bool) {
 	rLE := ec[:ThatLen]
 	c2 := ec[ThatLen:]
 
-	beBuf := make([]byte, ThatLen)
-	for i := 0; i < ThatLen; i++ {
-		beBuf[ThatLen-1-i] = rLE[i]
-	}
-	beBuf[0] &^= MSBByteMask // IntegerClearUnused
-	r := new(big.Int).SetBytes(beBuf)
-
-	qBig := big.NewInt(Q)
-	rem := new(big.Int)
-	c1 := make([]uint16, CoeffLen)
-	for i := 0; i < CoeffLen; i++ {
-		r.DivMod(r, qBig, rem)
-		u := rem.Uint64()
-		if u >= Q {
-			return nil, false
-		}
-		c1[i] = compress(uint32(u), DU)
-	}
-	if r.Sign() != 0 {
+	acc := make([]byte, ThatLen)
+	copy(acc, rLE)
+	acc[ThatLen-1] &^= MSBByteMask // IntegerClearUnused
+	vals := make([]uint16, CoeffLen)
+	if !radixDecode(vals, acc) {
 		return nil, false
+	}
+	c1 := make([]uint16, CoeffLen)
+	for i, u := range vals {
+		c1[i] = compress(uint32(u), DU)
 	}
 
 	ct := make([]byte, CiphertextLen)

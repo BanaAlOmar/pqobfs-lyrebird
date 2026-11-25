@@ -2,3 +2,10 @@
 *~
 
 /lyrebird
+
+# Release assets and local working files (not part of the source tree)
+zenodo-upload/
+pqobfs-jisa-revision.patch
+.pqobfs-sync/
+.DS_Store
+__pycache__/

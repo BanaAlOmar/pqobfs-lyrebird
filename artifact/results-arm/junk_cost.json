@@ -1,0 +1,11 @@
+{
+ "obfs4_junk_us": 38.917,
+ "pq_default_honest_bridge_us": 523.417,
+ "pq_default_junk_us": 50.75,
+ "pq_hybrid_honest_bridge_us": 670.959,
+ "pq_hybrid_junk_us": 178.708,
+ "pq_rejection_2keys_honest_bridge_us": 507.833,
+ "pq_rejection_2keys_junk_us": 97.083,
+ "pq_rejection_honest_bridge_us": 481.583,
+ "pq_rejection_junk_us": 71.458
+}

@@ -16,7 +16,7 @@ import (
 
 // pqTestSetup builds a node ID, the bridge's static ML-KEM-768 keypair, and a
 // fresh replay filter.
-func pqTestSetup(t *testing.T) (*ntor.NodeID, *mlkem_kemeleon.KeyPair, *replayfilter.ReplayFilter) {
+func pqTestSetup(t testing.TB) (*ntor.NodeID, *mlkem_kemeleon.KeyPair, *replayfilter.ReplayFilter) {
 	t.Helper()
 	nodeID, err := ntor.NewNodeID(make([]byte, ntor.NodeIDLength))
 	if err != nil {
@@ -196,7 +196,9 @@ func TestPQHandshakeWrongStaticKey(t *testing.T) {
 func TestPQHandshakeTranscriptTamper(t *testing.T) {
 	nodeID, staticKP, filter := pqTestSetup(t)
 
-	for _, off := range []int{pqCliCtOff + 7, pqCliEKOff + 100, pqCliMarkOff + 3, pqCoverLength + 1} {
+	// Offsets: c_S', ek', padding, mark (len-32), MAC (len-16).
+	for _, off := range []int{7, mlkem_kemeleon.EncodedCtLen + 100, pqClientKeyMaterialLength + 5,
+		pqHandshakeLength - markLength - macLength + 3, pqHandshakeLength - macLength + 1} {
 		clientHS, _ := newPQClientHandshake(nodeID, staticKP.RawEncapsulationKey())
 		hello, _ := clientHS.generateHandshake()
 		hello[off] ^= 0x01
@@ -206,7 +208,8 @@ func TestPQHandshakeTranscriptTamper(t *testing.T) {
 		}
 	}
 
-	for _, off := range []int{pqSrvCtOff + 9, pqSrvAuthOff + 2, pqSrvMarkOff, pqCoverLength + 5} {
+	for _, off := range []int{9, mlkem_kemeleon.EncodedCtLen + 2, pqServerKeyMaterialLength + 5,
+		pqHandshakeLength - markLength - macLength, pqHandshakeLength - macLength + 5} {
 		clientHS, _ := newPQClientHandshake(nodeID, staticKP.RawEncapsulationKey())
 		hello, _ := clientHS.generateHandshake()
 		serverHS := newPQServerHandshake(nodeID, staticKP)
@@ -229,5 +232,82 @@ func TestPQHandshakeKeyIndependence(t *testing.T) {
 	s2, _, _, _ := runPQHandshake(t, nodeID, staticKP, filter)
 	if bytes.Equal(s1, s2) {
 		t.Fatal("two handshakes derived the same KEY_SEED")
+	}
+}
+
+// TestPQUniformCoverRoundTrip exercises the drawn-length policy, including
+// the hide-parameter-set floors, and checks every length lies in its range.
+func TestPQUniformCoverRoundTrip(t *testing.T) {
+	nodeID, staticKP, filter := pqTestSetup(t)
+	for _, hide := range []bool{false, true} {
+		pol := pqUniformCover(hide)
+		for i := 0; i < 40; i++ {
+			clientHS, err := newPQClientHandshakeWithPolicy(nodeID, staticKP.RawEncapsulationKey(), pol, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hello, err := clientHS.generateHandshake()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(hello) < pol.clientFloor(pqSuite{}) || len(hello) > maxHandshakeLength {
+				t.Fatalf("client hello length %d outside [%d, %d]", len(hello), pol.clientFloor(pqSuite{}), maxHandshakeLength)
+			}
+			serverHS := newPQServerHandshake(nodeID, staticKP)
+			serverHS.policy = pol
+			serverHS.trailerLen = inlineSeedFrameLength
+			// Feed the hello in pieces, as TCP would.
+			var seed []byte
+			for cut := 1000; ; cut += 1000 {
+				if cut > len(hello) {
+					cut = len(hello)
+				}
+				seed, err = serverHS.parseClientHandshake(filter, hello[:cut])
+				if err == ErrMarkNotFoundYet && cut < len(hello) {
+					continue
+				}
+				break
+			}
+			if err != nil {
+				t.Fatalf("server parse: %v", err)
+			}
+			resp, err := serverHS.generateHandshake()
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire := len(resp) + inlineSeedFrameLength
+			if wire < pol.serverFloor(pqSuite{})+inlineSeedFrameLength || wire > maxHandshakeLength {
+				t.Fatalf("server first flight %d outside range", wire)
+			}
+			// Trailing data after MAC_S must be left for the caller.
+			trailing := append(append([]byte{}, resp...), make([]byte, inlineSeedFrameLength)...)
+			n, cseed, err := clientHS.parseServerHandshake(trailing)
+			if err != nil {
+				t.Fatalf("client parse: %v", err)
+			}
+			if n != len(resp) || !bytes.Equal(cseed, seed) {
+				t.Fatal("client and server disagree")
+			}
+		}
+	}
+}
+
+// TestPQFixedCoverWithTrailer checks that under the fixed policy the server
+// hello plus the transport's seed frame is exactly pqHandshakeLength.
+func TestPQFixedCoverWithTrailer(t *testing.T) {
+	nodeID, staticKP, filter := pqTestSetup(t)
+	clientHS, _ := newPQClientHandshake(nodeID, staticKP.RawEncapsulationKey())
+	hello, _ := clientHS.generateHandshake()
+	serverHS := newPQServerHandshake(nodeID, staticKP)
+	serverHS.trailerLen = inlineSeedFrameLength
+	if _, err := serverHS.parseClientHandshake(filter, hello); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := serverHS.generateHandshake()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp)+inlineSeedFrameLength != pqHandshakeLength {
+		t.Fatalf("server first flight = %d, want %d", len(resp)+inlineSeedFrameLength, pqHandshakeLength)
 	}
 }

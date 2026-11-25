@@ -1,0 +1,118 @@
+(* ProVerif model of the pq-obfs handshake as implemented in the lyrebird
+   branch (suite: rejection encoding, not hybrid; Kemeleon encodings are
+   modelled as invertible public maps, so they do not affect secrecy or
+   authentication).
+
+   STATUS: written against ProVerif 2.05 syntax but NOT YET RUN -- the
+   sandbox used to prepare it could not build ProVerif. Run:
+
+       proverif artifact/formal/pqobfs.pv
+
+   and record the results before citing them. Expected: all queries true.
+
+   Properties:
+     Q1  secrecy of the session key seed against an active network attacker
+         who knows the bridge line (pk_S, NodeID);
+     Q2  bridge authentication: if the client accepts a key with bridge
+         identity pk_S, the bridge holding sk_S derived the same key;
+     Q3  forward secrecy: the key stays secret if sk_S leaks after the
+         session (phase 1);
+     Q4  the mark/MAC key is secret from a bridge-line holder (sObfKE keying:
+         it cannot verify or forge marks). *)
+
+type skey. type pkey. type key. type coins. type nonce.
+
+free c: channel.
+
+(* KEM: ciphertext and shared secret from (pk, r); decaps inverts. *)
+fun pk(skey): pkey.
+fun kemct(pkey, coins): bitstring.
+fun kemss(pkey, coins): key.
+reduc forall s: skey, r: coins; decaps(s, kemct(pk(s), r)) = kemss(pk(s), r).
+
+(* Kemeleon encodings: public bijections. *)
+fun encCt(bitstring): bitstring.
+reduc forall x: bitstring; decCt(encCt(x)) = x.
+fun encEk(pkey): bitstring.
+reduc forall p: pkey; decEk(encEk(p)) = p.
+
+(* HMAC-SHA256 as a PRF / random oracle. *)
+fun hmac(bitstring, bitstring): bitstring.
+fun k2b(key): bitstring [data, typeConverter].
+
+(* Symmetric encryption, used only to test whether a derived key is known. *)
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; sdec(senc(m, k), k) = m.
+
+const t_mac_key, t_key, t_verify, t_mac, server_lbl: bitstring.
+
+free NodeID: bitstring.
+
+(* Secrecy targets. *)
+free sessionC: bitstring [private].
+free sessionS: bitstring [private].
+
+event ClientAccepts(pkey, bitstring).
+event BridgeDerives(pkey, bitstring).
+
+query attacker(sessionC).
+query attacker(sessionS).
+query p: pkey, k: bitstring; event(ClientAccepts(p, k)) ==> event(BridgeDerives(p, k)).
+
+(* Q4: the mark key under which client marks are computed. *)
+free markKeyProbe: bitstring [private].
+query attacker(markKeyProbe).
+
+let Client(pkS: pkey) =
+  new rS: coins; new ske: skey;
+  let cS = encCt(kemct(pkS, rS)) in
+  let KS = kemss(pkS, rS) in
+  let ek = encEk(pk(ske)) in
+  let mk = hmac(t_mac_key, (k2b(KS), NodeID)) in
+  let mC = hmac(mk, (cS, ek)) in
+  new pad: bitstring;
+  let macC = hmac(mk, (cS, ek, pad, mC)) in
+  out(c, (cS, ek, pad, mC, macC));
+  in(c, (ce: bitstring, auth: bitstring, padS: bitstring, mS: bitstring, macS: bitstring));
+  if mS = hmac(mk, (ce, auth)) then
+  if macS = hmac(mk, (ce, auth, padS, mS)) then
+  let Ke = decaps(ske, decCt(ce)) in
+  let s = (k2b(KS), k2b(Ke), NodeID, cS, ek, ce) in
+  let seed = hmac(t_key, s) in
+  if auth = hmac(t_mac, (hmac(t_verify, s), NodeID, server_lbl)) then
+  event ClientAccepts(pkS, seed);
+  out(c, senc(sessionC, seed)).  (* reveals sessionC iff seed is known *)
+
+let Bridge(skS: skey) =
+  in(c, (cS: bitstring, ek: bitstring, pad: bitstring, mC: bitstring, macC: bitstring));
+  let KS = decaps(skS, decCt(cS)) in
+  let mk = hmac(t_mac_key, (k2b(KS), NodeID)) in
+  if mC = hmac(mk, (cS, ek)) then
+  if macC = hmac(mk, (cS, ek, pad, mC)) then
+  new re: coins;
+  let pke = decEk(ek) in
+  let ce = encCt(kemct(pke, re)) in
+  let Ke = kemss(pke, re) in
+  let s = (k2b(KS), k2b(Ke), NodeID, cS, ek, ce) in
+  let seed = hmac(t_key, s) in
+  let auth = hmac(t_mac, (hmac(t_verify, s), NodeID, server_lbl)) in
+  event BridgeDerives(pk(skS), seed);
+  new padS: bitstring;
+  let mS = hmac(mk, (ce, auth)) in
+  out(c, (ce, auth, padS, mS, hmac(mk, (ce, auth, padS, mS))));
+  out(c, senc(sessionS, seed)).
+
+(* Probe for Q4: a secret encrypted under an honest client's mark key; the
+   attacker learns it iff it can compute the mark key. *)
+let MarkKeyProbe(pkS: pkey) =
+  new r: coins;
+  let mk = hmac(t_mac_key, (k2b(kemss(pkS, r)), NodeID)) in
+  out(c, kemct(pkS, r));
+  out(c, senc(markKeyProbe, mk)).
+
+process
+  new skS: skey;
+  let pkS = pk(skS) in
+  out(c, pkS);                       (* the bridge line is public *)
+  ( (!Client(pkS)) | (!Bridge(skS)) | (!MarkKeyProbe(pkS))
+  | phase 1; out(c, skS) )           (* Q3: sk_S leaks after the sessions *)

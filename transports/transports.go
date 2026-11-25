@@ -44,6 +44,10 @@ import (
 	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/transports/scramblesuit"
 )
 
+// extraTransports holds transports compiled in behind build tags (see
+// register_pqobfs.go).
+var extraTransports []base.Transport
+
 var transportMapLock sync.Mutex
 var transportMap map[string]base.Transport = make(map[string]base.Transport)
 
@@ -96,6 +100,11 @@ func Init() error {
 		new(snowflake.Transport),
 		webtunnel.Transport,
 	} {
+		if err := Register(v); err != nil {
+			return err
+		}
+	}
+	for _, v := range extraTransports {
 		if err := Register(v); err != nil {
 			return err
 		}

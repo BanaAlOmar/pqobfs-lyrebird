@@ -88,6 +88,7 @@ type obfs4ClientArgs struct {
 	publicKey  *ntor.PublicKey
 	sessionKey *ntor.Keypair
 	iatMode    int
+	padFloor   padFloor // coordinated cover (cover_policy.go); zero: unchanged
 }
 
 // Transport is the obfs4 implementation of the base.Transport interface.
@@ -126,6 +127,22 @@ func (t *Transport) ServerFactory(stateDir string, args *pt.Args) (base.ServerFa
 	ptArgs.Add(certArg, st.cert.String())
 	ptArgs.Add(iatArg, strconv.Itoa(st.iatMode))
 
+	// Coordinated cover (cover_policy.go): a padding floor is announced on
+	// the bridge line; the response-time policy is local to the bridge.
+	var floor padFloor
+	if v, ok := args.Get(padFloorArg); ok {
+		if floor, err = parsePadFloor(v); err != nil {
+			return nil, err
+		}
+		ptArgs.Add(padFloorArg, floor.String())
+	}
+	var resp respPolicy
+	if v, ok := args.Get(respDelayArg); ok {
+		if resp, err = parseRespPolicy(v); err != nil {
+			return nil, err
+		}
+	}
+
 	// Initialize the replay filter.
 	filter, err := replayfilter.New(replayTTL)
 	if err != nil {
@@ -139,7 +156,7 @@ func (t *Transport) ServerFactory(stateDir string, args *pt.Args) (base.ServerFa
 	}
 	rng := rand.New(drbg)
 
-	sf := &obfs4ServerFactory{t, &ptArgs, st.nodeID, st.identityKey, st.drbgSeed, iatSeed, st.iatMode, filter, rng.Intn(maxCloseDelay)}
+	sf := &obfs4ServerFactory{t, &ptArgs, st.nodeID, st.identityKey, st.drbgSeed, iatSeed, st.iatMode, filter, rng.Intn(maxCloseDelay), resp, floor}
 	return sf, nil
 }
 
@@ -202,7 +219,14 @@ func (cf *obfs4ClientFactory) ParseArgs(args *pt.Args) (interface{}, error) {
 		return nil, err
 	}
 
-	return &obfs4ClientArgs{nodeID, publicKey, sessionKey, iatMode}, nil
+	var floor padFloor
+	if v, ok := args.Get(padFloorArg); ok {
+		if floor, err = parsePadFloor(v); err != nil {
+			return nil, err
+		}
+	}
+
+	return &obfs4ClientArgs{nodeID, publicKey, sessionKey, iatMode, floor}, nil
 }
 
 func (cf *obfs4ClientFactory) Dial(network, addr string, dialFn base.DialFunc, args interface{}) (net.Conn, error) {
@@ -238,6 +262,9 @@ type obfs4ServerFactory struct {
 	replayFilter *replayfilter.ReplayFilter
 
 	closeDelay int
+
+	resp     respPolicy // coordinated cover (cover_policy.go)
+	padFloor padFloor
 }
 
 func (sf *obfs4ServerFactory) Transport() base.Transport {
@@ -251,6 +278,11 @@ func (sf *obfs4ServerFactory) Args() *pt.Args {
 func (sf *obfs4ServerFactory) WrapConn(conn net.Conn) (net.Conn, error) {
 	// Not much point in having a separate newObfs4ServerConn routine when
 	// wrapping requires using values from the factory instance.
+
+	// With a response-time target, read first and anchor the policy at the
+	// hello's arrival; the policy then hides the key generation below.
+	acceptTime := time.Now()
+	first, arrive, anchorErr := sf.resp.anchorRead(conn)
 
 	// Generate the session keypair *before* consuming data from the peer, to
 	// attempt to mask the rejection sampling due to use of Elligator2.  This
@@ -271,8 +303,15 @@ func (sf *obfs4ServerFactory) WrapConn(conn net.Conn) (net.Conn, error) {
 	c := &obfs4Conn{conn, true, lenDist, iatDist, sf.iatMode, bytes.NewBuffer(nil), bytes.NewBuffer(nil), make([]byte, consumeReadSize), nil, nil}
 
 	startTime := time.Now()
+	if !arrive.IsZero() || anchorErr != nil {
+		startTime = acceptTime
+	}
+	if anchorErr != nil {
+		c.closeAfterDelay(sf, startTime)
+		return nil, anchorErr
+	}
 
-	if err = c.serverHandshake(sf, sessionKey); err != nil {
+	if err = c.serverHandshake(sf, sessionKey, first, arrive); err != nil {
 		c.closeAfterDelay(sf, startTime)
 		return nil, err
 	}
@@ -323,7 +362,7 @@ func newObfs4ClientConn(conn net.Conn, args *obfs4ClientArgs) (c *obfs4Conn, err
 		return nil, err
 	}
 
-	if err = c.clientHandshake(args.nodeID, args.publicKey, args.sessionKey); err != nil {
+	if err = c.clientHandshake(args.nodeID, args.publicKey, args.sessionKey, args.padFloor); err != nil {
 		return nil, err
 	}
 
@@ -335,13 +374,16 @@ func newObfs4ClientConn(conn net.Conn, args *obfs4ClientArgs) (c *obfs4Conn, err
 	return
 }
 
-func (conn *obfs4Conn) clientHandshake(nodeID *ntor.NodeID, peerIdentityKey *ntor.PublicKey, sessionKey *ntor.Keypair) error {
+func (conn *obfs4Conn) clientHandshake(nodeID *ntor.NodeID, peerIdentityKey *ntor.PublicKey, sessionKey *ntor.Keypair, floor padFloor) error {
 	if conn.isServer {
 		return fmt.Errorf("clientHandshake called on server connection")
 	}
 
 	// Generate and send the client handshake.
 	hs := newClientHandshake(nodeID, peerIdentityKey, sessionKey)
+	if floor.client > 0 {
+		hs.padLen = floor.clientPadLen()
+	}
 	blob, err := hs.generateHandshake()
 	if err != nil {
 		return err
@@ -378,27 +420,43 @@ func (conn *obfs4Conn) clientHandshake(nodeID *ntor.NodeID, peerIdentityKey *nto
 	}
 }
 
-func (conn *obfs4Conn) serverHandshake(sf *obfs4ServerFactory, sessionKey *ntor.Keypair) error {
+func (conn *obfs4Conn) serverHandshake(sf *obfs4ServerFactory, sessionKey *ntor.Keypair, first []byte, arrive time.Time) error {
 	if !conn.isServer {
 		return fmt.Errorf("serverHandshake called on client connection")
 	}
 
 	// Generate the server handshake, and arm the base timeout.
 	hs := newServerHandshake(sf.nodeID, sf.identityKey, sessionKey)
+	if sf.padFloor.server > 0 {
+		hs.padLen = sf.padFloor.serverPadLen()
+	}
 	if err := conn.Conn.SetDeadline(time.Now().Add(serverHandshakeTimeout)); err != nil {
 		return err
 	}
 
 	// Consume the client handshake.
 	var hsBuf [maxHandshakeLength]byte
+	pending := first
 	for {
-		n, err := conn.Conn.Read(hsBuf[:])
-		if err != nil {
-			// The Read() could have returned data and an error, but there is
-			// no point in continuing on an EOF or whatever.
-			return err
+		var chunk []byte
+		if len(pending) > 0 {
+			// Bytes already read by anchorRead.
+			chunk, pending = pending, nil
+		} else {
+			n, err := conn.Conn.Read(hsBuf[:])
+			if err != nil {
+				// The Read() could have returned data and an error, but there is
+				// no point in continuing on an EOF or whatever.
+				return err
+			}
+			if arrive.IsZero() {
+				// Anchor the response-time policy at the first bytes of the hello:
+				// later reads are delayed by the bridge's own parsing work.
+				arrive = time.Now()
+			}
+			chunk = hsBuf[:n]
 		}
-		conn.receiveBuffer.Write(hsBuf[:n])
+		conn.receiveBuffer.Write(chunk)
 
 		seed, err := hs.parseClientHandshake(sf.replayFilter, conn.receiveBuffer.Bytes())
 		if err == ErrMarkNotFoundYet {
@@ -443,6 +501,7 @@ func (conn *obfs4Conn) serverHandshake(sf *obfs4ServerFactory, sessionKey *ntor.
 	if err := conn.makePacket(&frameBuf, packetTypePrngSeed, sf.lenSeed.Bytes()[:], 0); err != nil {
 		return err
 	}
+	sf.resp.release(arrive)
 	if _, err = conn.Conn.Write(frameBuf.Bytes()); err != nil {
 		return err
 	}

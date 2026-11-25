@@ -1,0 +1,35 @@
+# CI for the pqobfs transport: build both configurations, run all tests,
+# fuzz briefly, and check the Kemeleon output distribution with the
+# conformance suite, so encoder regressions (such as stuck unused bits) fail
+# the build instead of shipping.
+name: pqobfs
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.24" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: go vet ./... && go vet -tags pqobfs ./...
+      - run: go test ./...
+      - run: go test -tags pqobfs ./...
+      - name: Fuzz (30 s per target)
+        run: |
+          go test -run XXX -fuzz='^FuzzRadixDecode$' -fuzztime=30s ./internal/mlkem_kemeleon/
+          go test -run XXX -fuzz='^FuzzDecodeRoundTrip$' -fuzztime=30s ./internal/mlkem_kemeleon/
+          go test -tags pqobfs -run XXX -fuzz='^FuzzPQServerParse$' -fuzztime=30s ./transports/obfs4/
+          go test -tags pqobfs -run XXX -fuzz='^FuzzPQClientParse$' -fuzztime=30s ./transports/obfs4/
+      - name: Kemeleon conformance (output distribution)
+        run: |
+          pip install numpy scipy
+          CORPUS_DIR=/tmp/corpus CORPUS_N=5000 go test -tags corpus -run TestCorpus ./internal/mlkem_kemeleon/
+          for g in gostd circl; do
+            python3 artifact/conformance/kemeleon_conformance.py --kind ek --encoding rejection /tmp/corpus/ek_enc_$g.bin
+            python3 artifact/conformance/kemeleon_conformance.py --kind ct --encoding rejection /tmp/corpus/ct_enc_$g.bin
+            python3 artifact/conformance/kemeleon_conformance.py --kind ek --encoding raw --expect raw /tmp/corpus/ek_raw_$g.bin
+          done
+      - name: Decoding vectors (unused bits must be cleared)
+        run: go test -run TestDecodeVectors -v ./internal/mlkem_kemeleon/

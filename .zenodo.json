@@ -1,0 +1,16 @@
+{
+  "title": "pq-obfs in lyrebird: code, data and analysis for \"Migrating a Deployed Censorship-Circumvention Transport to Post-Quantum Key Exchange\"",
+  "upload_type": "software",
+  "description": "<p>Research artifact for the paper <em>Migrating a Deployed Censorship-Circumvention Transport to Post-Quantum Key Exchange: Wire-Image Leakage, Defenses, and Conformance Testing in Tor's obfs4</em> (Ban AlOmar and Zouheir Trabelsi, submitted to the Journal of Information Security and Applications).</p><p>Contents: a branch of Tor's lyrebird with the pq-obfs transport (Kemeleon-encoded ML-KEM-768, rejection and default encodings, X25519 hybrid, key rotation, key-identifier bridge lines) and the coordinated-cover options for obfs4 and pq-obfs (response-time normalization, obfs4 padding floor); the measurement harness and analysis scripts; a draft pq-obfs specification; Kemeleon decoding test vectors and a conformance tool; the Drivel evaluation harness; reports for the three upstream defects; and the result files and packet captures behind every table and figure. The artifact README maps each table and figure to the script and result file that produce it.</p>",
+  "creators": [
+    {"name": "AlOmar, Ban", "affiliation": "Higher Colleges of Technology, United Arab Emirates"},
+    {"name": "Trabelsi, Zouheir", "affiliation": "United Arab Emirates University, Al Ain, United Arab Emirates"}
+  ],
+  "keywords": ["Tor", "pluggable transports", "obfs4", "post-quantum migration", "ML-KEM", "Kemeleon", "censorship circumvention", "traffic analysis"],
+  "license": "BSD-3-Clause",
+  "version": "1.0.1",
+  "language": "eng",
+  "related_identifiers": [
+    {"identifier": "https://github.com/BanaAlOmar/pqobfs-lyrebird", "relation": "isSupplementTo", "scheme": "url"}
+  ]
+}

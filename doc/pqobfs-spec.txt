@@ -1,0 +1,229 @@
+                pqobfs (Post-Quantum obfs4) Protocol Specification
+                               DRAFT, version 0.2
+
+0. Status
+
+   Draft accompanying the lyrebird branch with build tag `pqobfs`. It
+   specifies the wire format implemented there. Interoperability with any
+   other implementation has not been tested.
+
+1. Overview
+
+   pqobfs replaces the X25519/ntor handshake of obfs4 [OBFS4] with the
+   pq-obfs construction [GSV24]: two ML-KEM-768 [FIPS203] encapsulations,
+   one to the bridge's long-term key (authentication) and one to a client
+   ephemeral key (forward secrecy). Every ML-KEM object on the wire is
+   Kemeleon-encoded [KEMELEON] so that it is computationally
+   indistinguishable from uniform bytes. Everything after the handshake --
+   framing, NaCl secretbox, packet-length and IAT obfuscation, the PRNG-seed
+   frame, the delayed close on failure -- is obfs4, unchanged.
+
+   pqobfs is a separate transport (name "pqobfs") with its own protocol
+   identifiers. Implementations MUST NOT negotiate between obfs4 and pqobfs
+   in band.
+
+2. Notation and suites
+
+   x | y        concatenation
+   HMAC(k, m)   HMAC-SHA256
+   E(...)       Kemeleon encoding (rejection or default variant, per suite)
+   L_ct, L_ek   encoded ciphertext / key lengths of the suite
+   L_dh         32 if the suite is hybrid, else 0
+
+   A suite is (encoding, hybrid):
+
+     encoding   L_ct   L_ek   protocol identifier PID
+     rejection  1252   1156   "pq-obfs-mlkem768-sha256-1"
+     default    1536   1184   "pq-obfs-mlkem768d-sha256-1"
+
+   A hybrid suite inserts "x25519" before "mlkem768" in PID (e.g.
+   "pq-obfs-x25519mlkem768-sha256-1") and adds X25519 keys encoded with
+   Elligator 2 [ELLIGATOR] exactly as obfs4 does.
+
+   Derived labels: t_mac_key = PID | ":mac_key", t_key = PID |
+   ":key_extract", t_verify = PID | ":key_verify", t_mac = PID | ":mac".
+
+3. Bridge credentials and bridge lines
+
+   A bridge holds NodeID (20 bytes), a long-term ML-KEM-768 key pair
+   (sk_S, pk_S), and, for hybrid suites, a long-term X25519 key pair (b, B).
+
+     cert  = NodeID | pk_S (1184 bytes, raw FIPS 203) [| B (32 bytes)]
+     pq-id = Base64(SHA-256(cert)[0..16]), without padding
+
+   Tor passes transport arguments to the client over SOCKS5, which limits
+   them to 510 bytes; cert does not fit. The bridge line given to Tor
+   therefore carries pq-id:
+
+     Bridge pqobfs <IP>:<PORT> <FINGERPRINT> pq-id=<..> iat-mode=<0|1|2>
+            pq-cover=<fixed|uniform|uniform-hide>
+            pq-encoding=<rejection|default> pq-hybrid=<0|1>
+
+   and cert is distributed alongside it, as a line "<pq-id> <Base64(cert)>"
+   in the client's pqobfs_bridgekeys.txt (in the transport state directory,
+   or the file named by PQOBFS_BRIDGEKEYS). A client MUST check that
+   SHA-256(cert) begins with the 16 bytes encoded in pq-id. Clients that
+   receive arguments by other means MAY accept pq-cert=<Base64(cert)>
+   directly.
+
+   Key rotation: a bridge MAY accept several long-term keys (a current key
+   and retired keys within a grace period). It then decapsulates c_S' under
+   every accepted key and looks for each resulting mark (Section 5.2); work
+   per connection is independent of the key the client used.
+
+4. Cover policies
+
+   The total length of each first flight is chosen by the bridge's cover
+   policy and announced in the bridge line; both sides apply it:
+
+     fixed          every first flight is 4112 bytes, in both directions
+     uniform        each message length is drawn uniformly from
+                    [suite minimum, 8192]
+     uniform-hide   as uniform, with the ML-KEM-1024 minima of the same
+                    suite as floors (rejection: client 3220, bridge 1722;
+                    default: client 3520, bridge 1984; plus L_dh in each
+                    direction if hybrid; bridge values before the seed
+                    frame)
+
+   For the bridge, the length includes the obfs4 PRNG-seed frame (45 bytes)
+   that follows the server hello in the same write.
+
+4.1 Coordinated cover (bridge-side, RECOMMENDED during migration)
+
+   During migration, pqobfs and obfs4 bridges share a deployment, so a
+   censor can compare them. Two bridge options make the first flights of
+   both transports indistinguishable by length and by response time. They
+   are bridge-side settings; neither changes the wire format.
+
+     resp-delay=target=T,jitter=J   (microseconds)
+         The bridge records the arrival time a of the first byte of the
+         client's first flight and writes its first flight at
+         a + T + U[0, J], where U is drawn with a CSPRNG for each
+         connection. If processing ends later than that, the reply goes out
+         at once. Anchoring at the first byte, rather than at the end of
+         processing, keeps decapsulation and encapsulation time out of the
+         observable delay. The bridge MUST post its first read as soon as
+         it accepts the connection, before any per-connection work (such as
+         generating a session key), so that this work cannot delay the
+         anchor. T SHOULD exceed the bridge's 99th-percentile
+         processing time. The wait SHOULD use a precise sleep (for example
+         nanosleep followed by a short spin), because coarse timers overshoot
+         by amounts that depend on the workload. "resp-delay=jitter=J" alone
+         adds U[0, J] after processing; used on pqobfs bridges only, it
+         widens the gap to obfs4 and MUST NOT be used as a defense.
+
+     pad-floor=C:S                    (obfs4 bridges)
+         The obfs4 bridge announces pad-floor in its bridge line. A client
+         that understands it draws its first-flight length uniformly from
+         [C, 8192]; the bridge draws its own from [S, 8192] (S includes the
+         45-byte seed frame). Old clients ignore the argument, and a bridge accepts
+         flights of any legal length, so the option is backward compatible.
+         To match the pqobfs uniform policy, C:S = 2440:1361 for the
+         rejection encoding and C:S = 2752:1645 for the default encoding.
+
+   Both options SHOULD be set to the same values on all bridges of a
+   distribution pool, pqobfs and obfs4 alike. Applying a delay policy to
+   one transport only creates a timing difference between the two.
+
+5. Handshake
+
+5.1 Client
+
+   Before connecting, the client generates (repeating Kemeleon's or
+   Elligator's rejection sampling as needed):
+
+     (ek, dk) <- ML-KEM.KeyGen,              ek' = E(ek)
+     (c_S, K_S) <- ML-KEM.Encaps(pk_S),      c_S' = E(c_S)
+     [hybrid] (x, X) X25519 key pair with Elligator 2 representative X'
+
+   Then:
+
+     static = K_S [| X25519(x, B)]
+     k      = HMAC(t_mac_key, static | NodeID)
+     KM_C   = c_S' | ek' [| X']
+     M_C    = HMAC(k, KM_C)[0..16]
+     P_C    = random bytes, so that the total matches the cover policy
+     E      = decimal string of the current epoch hour (as obfs4)
+     MAC_C  = HMAC(k, KM_C | P_C | M_C | E)[0..16]
+
+     ClientHello = KM_C | P_C | M_C | MAC_C
+
+5.2 Bridge
+
+   On receiving at least L_ct + L_ek + L_dh + 32 bytes, the bridge decodes
+   c_S' (every string of the right length decodes), decapsulates it under
+   each accepted long-term key (ML-KEM implicit rejection: a bad c_S yields
+   a pseudorandom K_S), derives static, k and M_C as above, and checks
+   whether the last 32 bytes received begin with M_C. It reads at most 8192
+   bytes. It then verifies MAC_C for E in {now, now - 1 h, now + 1 h},
+   evaluating all three, and rejects replays with the obfs4 replay filter.
+   On any failure the bridge sends nothing and closes the connection after
+   obfs4's per-bridge delay.
+
+   On success:
+
+     (c_e, K_e) <- ML-KEM.Encaps(E^-1(ek')),   c_e' = E(c_e)
+     [hybrid] (y, Y, Y') bridge ephemeral X25519 key pair, generated before
+              reading the client hello
+     eph    = K_e [| X25519(y, X)]
+     KM_S   = c_e' [| Y']
+     s      = static | eph | NodeID | KM_C | KM_S | PID
+     KEY_SEED = HMAC(t_key, s)
+     AUTH     = HMAC(t_mac, HMAC(t_verify, s) | NodeID | PID | "Server")
+     M_S      = HMAC(k, KM_S | AUTH)[0..16]
+     MAC_S    = HMAC(k, KM_S | AUTH | P_S | M_S | E)[0..16]
+
+     ServerHello = KM_S | AUTH | P_S | M_S | MAC_S
+
+   followed in the same write by the obfs4 PRNG-seed frame.
+
+5.3 Client completion
+
+   The client finds M_S by searching from offset L_ct + L_dh + 32 (data may
+   follow MAC_S), verifies MAC_S, decapsulates c_e with dk, computes
+   [X25519(x, Y)], recomputes s, KEY_SEED and AUTH, and aborts unless AUTH
+   matches. Both sides then key the obfs4 data channel from KEY_SEED exactly
+   as obfs4 does (Section 5 of [OBFS4]).
+
+6. Encoding requirements
+
+   Rejection encoding: the six unused high-order bits of the last
+   accumulator byte (byte 1123, mask 0xFC, for ML-KEM-768) MUST be filled
+   with fresh random bits by the encoder and MUST be cleared by the decoder,
+   for keys and ciphertexts alike. artifact/vectors contains decoding vectors
+   covering all 64 values. Implementations SHOULD test their output
+   distribution (artifact/conformance), not only round trips.
+
+   Default (non-rejecting) encoding: the encoder outputs r + m q^l for an
+   integer r < q^l and a uniform m, written into a fixed number of bytes.
+   The bound on m MUST be chosen so that the output range is the full
+   byte string (b + t equal to the number of output bits); otherwise the
+   high-order bits of the first or last byte are always zero. Setting t to
+   the security level without this adjustment leaves 2 (ML-KEM-768) to 6
+   (ML-KEM-1024) fixed bits when the whole ciphertext is encoded as one
+   integer.
+
+7. Security considerations
+
+   - Uniformity of Kemeleon encodings is computational (MLWE); Elligator 2's
+     is statistical. Hybrid suites hedge key-exchange security, not
+     encoding uniformity.
+   - A fixed cover length identifies a bridge from a single connection to a
+     length-aware observer; drawn policies require many connections to one
+     bridge. Message lengths below the suite minimum never occur.
+   - The bridge's encapsulation to ek happens after the client hello and
+     takes measurable time; with the rejection encoding its retries add
+     variance. The default encoding never retries. The difference in
+     response time from obfs4 is removed by resp-delay (Section 4.1),
+     applied to both transports.
+   - Compromise of sk_S (and b) lets an observer verify marks and identify
+     the bridge's connections; rotate keys (Section 3).
+
+References
+
+   [FIPS203]   NIST FIPS 203, Module-Lattice-Based Key-Encapsulation
+               Mechanism Standard, 2024.
+   [GSV24]     Günther, Stebila, Veitch, Obfuscated Key Exchange, CCS 2024.
+   [KEMELEON]  draft-irtf-cfrg-kemeleon.
+   [OBFS4]     doc/obfs4-spec.txt.
+   [ELLIGATOR] Bernstein, Hamburg, Krasnova, Lange, CCS 2013.
